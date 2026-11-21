@@ -17,8 +17,9 @@ from world import World
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "6"))  # power at which we always push        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
+PUSH_RATIO = float(os.environ.get("MECHBOT_PUSH", "0.25"))   # push when expected fight ratio >= this (1.0 = only when ahead)
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
 PEEK_DMG_CAP = 0.11      # leave the peek once we lost this fraction of max hp during it
@@ -305,6 +306,28 @@ class Bot:
         self.pos_hist.append((t, self.pos[0], self.pos[1]))
         self.pos_hist = [h for h in self.pos_hist if t - h[0] <= 1.2]
 
+    def dps_est(self, kinds, cubes, d):
+        """Rough effective dps of a loadout at range d (misses included)."""
+        s = 0.0
+        for k in kinds:
+            if k == "gun":
+                s += 110.0 if d < 120 else 70.0 if d < 190 else 25.0
+            elif k == "laser":
+                s += 105.0 if d < 270 else 0.0
+            elif k == "lightning":
+                s += 170.0 if d < 45 else 0.0
+        return max(55.0, s) * (1.0 + 0.04 * cubes)
+
+    def fight_ratio(self):
+        """>1 means we expect to win the fight against everything currently tracked nearby."""
+        thr = [e for e in self.enemies if e["_d"] < 170]
+        if not thr:
+            return None
+        mine = self.dps_est(self.my_weapons(), self.me.get("cubes", 0), 60.0)
+        en_dps = sum(self.dps_est(e.get("weapons") or ["gun"], e.get("cubes", 0), max(e["_d"], 30.0)) for e in thr)
+        en_hp = sum(e.get("hp", 1400) for e in thr)
+        return (self.hp * mine) / max(1.0, en_hp * en_dps)
+
     # ------------------------------------------------------------------ power / aggression
     def power(self, target=None):
         """A rough 'how strong am I' score: cubes + a second weapon + time pressure."""
@@ -316,30 +339,23 @@ class Bot:
         return p
 
     def is_aggro(self, target):
+        """Push or play from cover?  Decided by who is winning the fight, not by a fixed power score."""
         p = self.power(target)
-        want = p >= AGGRO_SCORE
-        if self.aggro_state:
-            want = p >= AGGRO_SCORE - 0.5       # hysteresis
-        # duel: a lone tracked enemy that isn't clearly stronger gets fought properly even when weak.
-        # (Hunters know where we are, so hiding from a single one just means being shot while "hidden".)
-        if (not want and DUEL and target is not None and target.get("kind") == "mech"
-                and len(self.enemies) == 1 and self.hpf > (0.35 if self.duel_state else 0.55)
-                and target.get("hp", 1400) <= self.hp * 1.35 + 200
-                and target.get("cubes", 0) <= self.me.get("cubes", 0) + 3):
-            self.duel_state = True
-            return True
-        self.duel_state = False
+        ratio = self.fight_ratio()
+        if ratio is None:
+            want = self.hpf > 0.75                       # nobody near: be ready to hunt sounds
+        else:
+            hi = PUSH_RATIO if not self.aggro_state else PUSH_RATIO * 0.7   # hysteresis
+            want = ratio >= hi
+            if len(self.enemies) == 1 and ratio >= PUSH_RATIO * 0.5 and DUEL:
+                want = True                              # a lone hunter knows where we are: fight it
+            if p >= AGGRO_SCORE and AGGRO_SCORE > 0:
+                want = True
         if self.hpf < AGGRO_HP_MIN:
             want = False
-        if want and target is not None and target.get("kind") == "mech":
-            tc = target.get("cubes", 0)
-            if tc > self.me.get("cubes", 0) + 4 and target.get("hp", 1400) > self.hp * 1.15:
-                want = False
-        n_en = sum(1 for e in self.enemies if e["_d"] < 120 and (e["_vis"] or e["_los"]))
-        if want and n_en >= 3 and p < 2 and AGGRO_SCORE > 0:
-            want = False
         if want != self.aggro_state:
-            self.log("AGGRO %s (power %.1f)" % ("ON" if want else "off", p), True)
+            self.log("AGGRO %s (ratio %s power %.1f)" % ("ON" if want else "off",
+                                                        "n/a" if ratio is None else "%.2f" % ratio, p), True)
         self.aggro_state = want
         return want
 
