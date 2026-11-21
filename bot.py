@@ -17,7 +17,7 @@ from world import World
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-AGGRO_SCORE = 4.0        # power score at which the bot stops peeking and just beams (see power())
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
@@ -336,7 +336,7 @@ class Bot:
             if tc > self.me.get("cubes", 0) + 4 and target.get("hp", 1400) > self.hp * 1.15:
                 want = False
         n_en = sum(1 for e in self.enemies if e["_d"] < 120 and (e["_vis"] or e["_los"]))
-        if want and n_en >= 3 and p < 8:
+        if want and n_en >= 3 and p < 2 and AGGRO_SCORE > 0:
             want = False
         if want != self.aggro_state:
             self.log("AGGRO %s (power %.1f)" % ("ON" if want else "off", p), True)
@@ -747,8 +747,8 @@ class Bot:
         if "lightning" in tw and not self.has("lightning"):
             pref = max(pref, 75.0)       # stay out of the arc
         if aggressive:
-            pref *= 0.85
-        rad = 1.0 if d > pref + 14 else (-1.0 if d < pref - 14 else 0.0)
+            pref *= 0.6 if not self.has("laser") else 0.8
+        rad = 1.0 if d > pref + 10 else (-1.0 if d < pref - 18 else 0.0)
         flip_fast = target["_aimed"] or target.get("charging")
         if t > self.strafe_until:
             if self.rng.random() < 0.65:
@@ -760,7 +760,7 @@ class Bot:
                 self.kick_until = t + 0.22
                 self.kick_ready = t + 0.8
         tx, ty = -uy * self.strafe, ux * self.strafe
-        move = norm(ux * rad * 0.8 + tx, uy * rad * 0.8 + ty)
+        move = norm(ux * rad * (1.0 if aggressive else 0.8) + tx, uy * rad * (1.0 if aggressive else 0.8) + ty)
         boost = t < self.kick_until or (aggressive and rad > 0 and d > 150 and self.me["energy"] > 85)
         return move, boost
 
