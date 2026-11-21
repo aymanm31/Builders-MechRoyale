@@ -18,6 +18,7 @@ TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
 AGGRO_SCORE = 4.0        # power score at which the bot stops peeking and just beams (see power())
+DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
 PEEK_DMG_CAP = 0.11      # leave the peek once we lost this fraction of max hp during it
@@ -97,6 +98,8 @@ class Bot:
         self.peek_t0 = 0.0
         self.peek_count = 0
         self.aggro_state = False
+        self.duel_state = False
+        self.focus_id = None
         self.strafe = 1
         self.strafe_until = 0.0
         self.kick_until = 0.0
@@ -317,6 +320,15 @@ class Bot:
         want = p >= AGGRO_SCORE
         if self.aggro_state:
             want = p >= AGGRO_SCORE - 0.5       # hysteresis
+        # duel: a lone tracked enemy that isn't clearly stronger gets fought properly even when weak.
+        # (Hunters know where we are, so hiding from a single one just means being shot while "hidden".)
+        if (not want and DUEL and target is not None and target.get("kind") == "mech"
+                and len(self.enemies) == 1 and self.hpf > (0.35 if self.duel_state else 0.55)
+                and target.get("hp", 1400) <= self.hp * 1.35 + 200
+                and target.get("cubes", 0) <= self.me.get("cubes", 0) + 3):
+            self.duel_state = True
+            return True
+        self.duel_state = False
         if self.hpf < AGGRO_HP_MIN:
             want = False
         if want and target is not None and target.get("kind") == "mech":
@@ -775,7 +787,10 @@ class Bot:
                   and t - self.enemy_seen.get(e["id"], -99) < 5.0]
         target = None
         if vis_en:
-            target = min(vis_en, key=lambda e: e.get("hp", 1400) * (0.6 + e["_d"] / 250.0))
+            # focus fire: stick with the current victim (damage spread over several mechs just regenerates)
+            target = min(vis_en, key=lambda e: e.get("hp", 1400) * (0.6 + e["_d"] / 250.0)
+                         * (0.55 if e["id"] == self.focus_id else 1.0))
+            self.focus_id = target["id"]
         elif mem_en:
             target = mem_en[0]
         # how exposed are we: can the nearest threat see us?
