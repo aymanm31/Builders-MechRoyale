@@ -12,14 +12,14 @@ import time
 
 import mechfight as mf
 from cover import CoverPlanner
+from roof import RoofPlanner
 from world import World
 
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "6"))  # power at which we always push        # power score at which the bot stops peeking and just beams (see power())
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "3"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
-PUSH_RATIO = float(os.environ.get("MECHBOT_PUSH", "0.25"))   # push when expected fight ratio >= this (1.0 = only when ahead)
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
 PEEK_DMG_CAP = 0.11      # leave the peek once we lost this fraction of max hp during it
@@ -31,6 +31,8 @@ UPGRADE_RANK = [
     "lightning_chain", "gun_velocity", "gun_mag", "lightning_range", "laser_pierce",
     "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
+AIM_LAT = 0.08            # s between the observation and the action taking effect (lead compensation)
+LASER_RANK = ["laser_damage", "laser_charge", "armor", "laser_pierce"]
 HOSTILE_SOUNDS = ("gun", "laser", "laser_charge", "lightning", "mortar", "explosion")
 CLOSE_SOUNDS = ("step", "boost", "jet", "reload")
 
@@ -54,7 +56,7 @@ def rot(x, y, a):
 
 
 class Bot:
-    name = "peeker-v1"
+    name = "peeker-v1.3"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -70,6 +72,10 @@ class Bot:
         t = time.time()
         self.world = World(dirs)
         self.planner = CoverPlanner(self.world)
+        self.rp = RoofPlanner(self.world, dirs)
+        self.roof = None
+        self.roof_cd = 10.0
+        self._roof_jump = False
         mf.log("map loaded in %.2fs" % (time.time() - t))
         self.wcfg = self.cfg["weapons"]
         self.tick_budget = self.cfg["bot"]["tick_budget_ms"] / 1000.0
@@ -228,12 +234,15 @@ class Bot:
         self.hp_hist.append((t, self.hp))
         self.hp_hist = [h for h in self.hp_hist if t - h[0] <= 1.5]
         self.new_dmg = []
+        self._dmg_log = [(a, b) for a, b in getattr(self, "_dmg_log", []) if t - a < 4.0]
         for e in obs["events"]:
             ty = e["type"]
             if ty == "damaged":
                 self.last_dmg_t = t
                 self.stats_dmg_in += e.get("amount", 0)
                 self.new_dmg.append(e)
+                if e.get("weapon") != "zone":
+                    self._dmg_log.append((t, e.get("amount", 0)))
                 if e.get("bearing") is not None:
                     self.last_dmg_bearing = e["bearing"]
                     self.alert = (e["bearing"], t + 2.0, "near")
@@ -306,27 +315,15 @@ class Bot:
         self.pos_hist.append((t, self.pos[0], self.pos[1]))
         self.pos_hist = [h for h in self.pos_hist if t - h[0] <= 1.2]
 
-    def dps_est(self, kinds, cubes, d):
-        """Rough effective dps of a loadout at range d (misses included)."""
-        s = 0.0
-        for k in kinds:
-            if k == "gun":
-                s += 110.0 if d < 120 else 70.0 if d < 190 else 25.0
-            elif k == "laser":
-                s += 105.0 if d < 270 else 0.0
-            elif k == "lightning":
-                s += 170.0 if d < 45 else 0.0
-        return max(55.0, s) * (1.0 + 0.04 * cubes)
-
-    def fight_ratio(self):
-        """>1 means we expect to win the fight against everything currently tracked nearby."""
-        thr = [e for e in self.enemies if e["_d"] < 170]
-        if not thr:
-            return None
-        mine = self.dps_est(self.my_weapons(), self.me.get("cubes", 0), 60.0)
-        en_dps = sum(self.dps_est(e.get("weapons") or ["gun"], e.get("cubes", 0), max(e["_d"], 30.0)) for e in thr)
-        en_hp = sum(e.get("hp", 1400) for e in thr)
-        return (self.hp * mine) / max(1.0, en_hp * en_dps)
+    def contested(self, p, factor=0.7):
+        """True when a tracked enemy mech is much closer to point p than we are (it will get there first)."""
+        myd = hyp(p, self.pos)
+        for e in self.enemies:
+            if not (e["_vis"] or self.t - self.enemy_seen.get(e["id"], -99) < 5.0):
+                continue
+            if hyp(e["pos"], p) + 12.0 < myd * factor:
+                return True
+        return False
 
     # ------------------------------------------------------------------ power / aggression
     def power(self, target=None):
@@ -339,23 +336,30 @@ class Bot:
         return p
 
     def is_aggro(self, target):
-        """Push or play from cover?  Decided by who is winning the fight, not by a fixed power score."""
         p = self.power(target)
-        ratio = self.fight_ratio()
-        if ratio is None:
-            want = self.hpf > 0.75                       # nobody near: be ready to hunt sounds
-        else:
-            hi = PUSH_RATIO if not self.aggro_state else PUSH_RATIO * 0.7   # hysteresis
-            want = ratio >= hi
-            if len(self.enemies) == 1 and ratio >= PUSH_RATIO * 0.5 and DUEL:
-                want = True                              # a lone hunter knows where we are: fight it
-            if p >= AGGRO_SCORE and AGGRO_SCORE > 0:
-                want = True
+        want = p >= AGGRO_SCORE
+        if self.aggro_state:
+            want = p >= AGGRO_SCORE - 0.5       # hysteresis
+        # duel: a lone tracked enemy that isn't clearly stronger gets fought properly even when weak.
+        # (Hunters know where we are, so hiding from a single one just means being shot while "hidden".)
+        if (not want and DUEL and target is not None and target.get("kind") == "mech"
+                and len(self.enemies) == 1 and self.hpf > (0.35 if self.duel_state else 0.55)
+                and target.get("hp", 1400) <= self.hp * 1.35 + 200
+                and target.get("cubes", 0) <= self.me.get("cubes", 0) + 3):
+            self.duel_state = True
+            return True
+        self.duel_state = False
         if self.hpf < AGGRO_HP_MIN:
             want = False
+        if want and target is not None and target.get("kind") == "mech":
+            tc = target.get("cubes", 0)
+            if tc > self.me.get("cubes", 0) + 4 and target.get("hp", 1400) > self.hp * 1.15:
+                want = False
+        n_en = sum(1 for e in self.enemies if e["_d"] < 120 and (e["_vis"] or e["_los"]))
+        if want and n_en >= 3 and p < 2 and AGGRO_SCORE > 0:
+            want = False
         if want != self.aggro_state:
-            self.log("AGGRO %s (ratio %s power %.1f)" % ("ON" if want else "off",
-                                                        "n/a" if ratio is None else "%.2f" % ratio, p), True)
+            self.log("AGGRO %s (power %.1f)" % ("ON" if want else "off", p), True)
         self.aggro_state = want
         return want
 
@@ -507,13 +511,25 @@ class Bot:
 
     # ------------------------------------------------------------------ aiming helpers
     def lead(self, tp, tv, speed, src):
-        d = math.dist(src, tp)
-        t = d / speed
+        """Where to aim so the shot meets a constant-velocity target. The action only takes effect ~LAT s after the
+        observation, so the target keeps moving (and we do too) before the shot leaves."""
+        v = self.vel
+        src = (src[0] + v[0] * AIM_LAT, src[1] + v[1] * AIM_LAT, src[2])
+        t = math.dist(src, tp) / speed + AIM_LAT
         p = tp
         for _ in range(4):
             p = (tp[0] + tv[0] * t, tp[1] + tv[1] * t, tp[2] + tv[2] * t * 0.3)
-            t = min(1.5, math.dist(src, p) / speed)
+            t = min(1.5, math.dist(src, p) / speed) + AIM_LAT
         return p, t
+
+    def proj_aim(self, cy, cp, dt=0.1):
+        """Where the torso will point after dt if we command (cy, cp): it slews at turn_rate / pitch_rate."""
+        st = self.me["stats"]
+        ry = st.get("turn_rate", 4.0) * dt
+        rp = st.get("pitch_rate", 3.0) * dt
+        y = self.aim[0] + max(-ry, min(ry, adiff(cy, self.aim[0])))
+        p = self.aim[1] + max(-rp, min(rp, cp - self.aim[1]))
+        return y, p
 
     def aim_at(self, p, src):
         dx, dy, dz = p[0] - src[0], p[1] - src[1], p[2] - src[2]
@@ -544,7 +560,7 @@ class Bot:
         aim_yaw, aim_pitch = gun_yaw, gun_pitch
         los_ok = target["_los"] and self.world.los(mz, tc)
         laser_charging = any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in weapons)
-        laser_ok_mode = mode in ("peek", "cover", "brawl", "kite", "hunt") and self.hpf > 0.3
+        laser_ok_mode = mode in ("peek", "cover", "brawl", "kite", "hunt", "perch", "flee", "drop") and self.hpf > 0.15
         aggro = self.aggro_state
         for i, w in enumerate(weapons):
             if not w:
@@ -553,8 +569,9 @@ class Bot:
             st = w.get("stats", {})
             if k == "laser":
                 ly, lpit = self.aim_at((tc[0] + tv[0] * 0.15, tc[1] + tv[1] * 0.15, tc[2]), mz)
-                err = abs(adiff(ly, self.aim[0]))
-                perr = abs(lpit - self.aim[1])
+                py_, pp_ = self.proj_aim(ly, lpit)
+                err = abs(adiff(ly, py_))
+                perr = abs(lpit - pp_)
                 tol = math.atan2(1.9, max(8.0, d))
                 charge = w.get("charge", 0.0)
                 full = st.get("charge", 0.75)
@@ -579,11 +596,14 @@ class Bot:
                     fire[i] = True
                     aim_yaw, aim_pitch = ly, lpit
             elif k == "gun":
-                err = abs(adiff(gun_yaw, self.aim[0]))
+                py_, pp_ = self.proj_aim(gun_yaw, gun_pitch)
+                err = abs(adiff(gun_yaw, py_))
+                perr_g = abs(gun_pitch - pp_)
                 tol = math.atan2(2.4, max(5.0, d)) + 0.01
+                ptol = math.atan2(3.2, max(5.0, d)) + 0.015
                 rng = min(st.get("range", 230) - 8, 215 if aggro else 190)
                 ammo = w.get("ammo", 1)
-                if los_ok and d < rng and err < tol and ammo > 0 and w.get("reload", 0) <= 0:
+                if los_ok and d < rng and err < tol and perr_g < ptol and ammo > 0 and w.get("reload", 0) <= 0:
                     if not (laser_charging and abs(adiff(aim_yaw, gun_yaw)) > tol):
                         fire[i] = True
                 if ammo == 0 and w.get("reload", 0) == 0:
@@ -780,6 +800,134 @@ class Bot:
         boost = t < self.kick_until or (aggressive and rad > 0 and d > 150 and self.me["energy"] > 85)
         return move, boost
 
+    # ------------------------------------------------------------------ rooftops
+    def roof_end(self, why, cd=25.0):
+        self.log("ROOF end: %s" % why, True)
+        self.roof = None
+        self.roof_cd = self.t + cd
+
+    def roof_step(self, target, zurgent, vis_en):
+        """Returns (move, boost, mode) while a roof plan is active/started, else None."""
+        t, me = self.t, self.me
+        r = self.roof
+        thr = target["pos"] if target is not None else None
+        if r is None:
+            dur = float(self.cfg["match"].get("duration_s", 480))
+            if (t > 0.30 * dur or me.get("cubes", 0) >= 8):
+                return None                  # rooftops are an early-game tool only
+            if (target is None or not target["_vis"] or zurgent or t < self.roof_cd or self.hpf < 0.6
+                    or not (45 < target["_d"] < 230) or len([e for e in vis_en if e["_d"] < 150]) > 2
+                    or me["energy"] < 60 or not me.get("grounded", True) or not self.rp.sites):
+                return None
+            ch = self.rp.choose(self.pos, thr, 45.0, me["energy"], lambda p: self.in_safe_zone(p, 12))
+            if ch is None:
+                self.roof_cd = t + 4.0
+                return None
+            site, B, E = ch
+            self.roof = r = {"site": site, "B": B, "E": E, "ph": "approach", "t0": t, "tp": t, "drop_dir": None,
+                              "last_thr": thr, "seen": t}
+            self.log("ROOF start top=%.0f rise=%.0f walk=%.0f" % (site.top, site.rise, hyp(E, self.pos)), True)
+        site = r["site"]
+        if t - r["t0"] > (14.0 if r["ph"] in ("approach", "climb", "mount") else 40.0) and r["ph"] != "drop":
+            if r["ph"] == "perch":
+                r["ph"] = "drop"
+            else:
+                self.roof_end("timeout in %s" % r["ph"], 40.0)
+                return None
+        if r["ph"] != "drop" and (zurgent or self.hpf < 0.35):
+            if r["ph"] == "perch":
+                r["ph"] = "drop"
+            else:
+                self.roof_end("abort low hp/zone", 20.0)
+                return None
+        if r["ph"] in ("approach", "climb", "mount") and sum(x for tt, x in self._dmg_log if t - tt < 3.0) > 0.25 * self.maxhp:
+            self.roof_end("shot up on the way", 30.0)
+            return None
+        ph = r["ph"]
+        pz = self.pos[2]
+        self._roof_jump = False
+        if ph == "approach":
+            if hyp(r["E"], self.pos) < 4.5:
+                r["ph"] = ph = "climb"
+            else:
+                return self.path_dir(r["E"]), me["energy"] > 90, "roofgo"
+        if ph == "climb":
+            bx, by = r["B"]
+            mv = norm(bx - self.pos[0], by - self.pos[1])
+            if pz >= site.top - 0.3:
+                r["ph"] = ph = "mount"
+            else:
+                if me["energy"] < 4 and not me.get("grounded", True):
+                    self.roof_end("out of energy", 30.0)
+                    return None
+                self._roof_jump = bool(me.get("grounded", True))
+                return mv, True, "climb"
+        if ph == "mount":
+            if pz < site.top - 1.5:
+                r["ph"] = "climb"
+                return norm(r["B"][0] - self.pos[0], r["B"][1] - self.pos[1]), True, "climb"
+            if site.inside(self.pos[0], self.pos[1], 1.5) and me.get("grounded", True):
+                r["ph"] = ph = "perch"
+                r["tp"] = t
+                self.log("ROOF perch", True)
+            else:
+                mv = norm(site.cx - self.pos[0], site.cy - self.pos[1])
+                return mv, pz < site.top + 0.5 and me["energy"] > 3, "climb"
+        if ph == "perch":
+            hurt = sum(a for tt, a in self._dmg_log if t - tt < 2.5)
+            if target is not None:
+                r["last_thr"] = target["pos"]
+                r["seen"] = t
+            dur = float(self.cfg["match"].get("duration_s", 480))
+            if (self.hpf < 0.5 or hurt > 0.2 * self.maxhp or t - r.get("seen", t) > 7.0
+                    or pz < site.top - 14.0 or t > 0.38 * dur or me.get("cubes", 0) >= 10):
+                r["ph"] = ph = "drop"
+                lt = r.get("last_thr") or thr
+                r["drop_dir"] = norm(self.pos[0] - lt[0], self.pos[1] - lt[1]) if lt else (1.0, 0.0)
+                r["t_drop"] = t
+                self.log("ROOF drop (hp %.0f%% hurt %.0f)" % (self.hpf * 100, hurt), True)
+            else:
+                # stand at the edge FAR from the threat (the building shields us), strafe along it, and hop up on the
+                # thrusters just enough to see over the roof line when there is no line of sight.
+                lt = r.get("last_thr") or thr
+                if t - r.get("spot_t", -9) > 1.5 or r.get("spot") is None:
+                    best, bd = None, -1.0
+                    for bx, by in site.boundary_points(5.0):
+                        ux, uy = site.cx - bx, site.cy - by
+                        L = math.hypot(ux, uy) or 1.0
+                        qx, qy = bx + ux / L * 4.0, by + uy / L * 4.0
+                        if site.inside(qx, qy, 2.5):
+                            dd_ = hyp((qx, qy), lt)
+                            if dd_ > bd:
+                                best, bd = (qx, qy), dd_
+                    r["spot"] = best or (site.cx, site.cy)
+                    r["spot_t"] = t
+                spot = r["spot"]
+                dd = hyp(spot, self.pos)
+                if dd > 4.0:
+                    return norm(spot[0] - self.pos[0], spot[1] - self.pos[1]), False, "perch"
+                ux, uy = norm(lt[0] - self.pos[0], lt[1] - self.pos[1])
+                if t > self.strafe_until:
+                    self.strafe = -self.strafe
+                    self.strafe_until = t + 0.5 + self.rng.random() * 0.8
+                mv = (-uy * self.strafe, ux * self.strafe)
+                if not site.inside(self.pos[0] + mv[0] * 4.0, self.pos[1] + mv[1] * 4.0, 1.8):
+                    self.strafe = -self.strafe
+                    mv = (-mv[0], -mv[1])
+                tz = lt[2] + 4.5 if len(lt) > 2 else site.top - 5.0
+                has_los = self.world.los(self.muzzle(), (lt[0], lt[1], tz))
+                hop = (not has_los) and me["energy"] > 25 and pz < site.top + 12.0
+                if hop:
+                    self._roof_jump = bool(me.get("grounded", True))
+                return mv, hop, "perch"
+        if ph == "drop":
+            dd = r["drop_dir"] or (1.0, 0.0)
+            if (pz < site.top - 3.0 and me.get("grounded", True)) or t - r.get("t_drop", t) > 8.0:
+                self.roof_end("dropped", 25.0)
+                return None
+            return dd, False, "drop"
+        return None
+
     # ------------------------------------------------------------------ main
     def act(self, obs):
         self.t0 = time.perf_counter()
@@ -789,8 +937,9 @@ class Bot:
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             best, bi = 99, 0
+            rank = LASER_RANK + UPGRADE_RANK if self.has("laser") else UPGRADE_RANK
             for i, ch in enumerate(obs["offer"]["choices"]):
-                r = UPGRADE_RANK.index(ch["id"]) if ch["id"] in UPGRADE_RANK else 50
+                r = rank.index(ch["id"]) if ch["id"] in rank else 50
                 if r < best:
                     best, bi = r, i
             act["pick"] = bi
@@ -844,7 +993,12 @@ class Bot:
         engaged = target is not None or pseudo is not None
         try:
             handled = False
-            if engaged:
+            if self.roof is not None or engaged:
+                rr = self.roof_step(target, zurgent, vis_en)
+                if rr is not None:
+                    move, boost, mode = rr
+                    handled = True
+            if engaged and not handled:
                 thr_pos = target["pos"] if target is not None else pseudo
                 tooclose = target is not None and target["_d"] < 38
                 if zurgent:
@@ -956,19 +1110,21 @@ class Bot:
         # ---- dodge (walk or thruster burst)
         charging = any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in weapons)
         smult = me["stats"].get("charge_move_mult", 0.5) if charging else 1.0
-        if mode != "error" and (move[0] or move[1] or obs["projectiles"] or lasers) and self.time_left() > 0.012:
-            mx, my, dboost = self.dodge(move[0], move[1], smult, allow_boost=not charging, lasers=lasers)
+        if mode not in ("error", "climb", "roofgo_x") and (move[0] or move[1] or obs["projectiles"] or lasers) and self.time_left() > 0.012:
+            mx, my, dboost = self.dodge(move[0], move[1], smult, allow_boost=not charging and mode != "perch", lasers=lasers)
+            if mode == "perch" and self.roof is not None and not self.roof["site"].inside(self.pos[0] + mx * 5.0, self.pos[1] + my * 5.0, 1.5):
+                mx, my, dboost = move[0], move[1], False
             if dboost:
                 boost = True
             move = (mx, my)
-        if charging:
+        if charging and mode not in ("climb", "perch"):
             boost = False
         # stuck handling (not while deliberately holding still)
         if t < self.stuck_until:
             move = self.stuck_dir
             act["jump"] = True
             boost = me["energy"] > 20
-        elif (move[0] or move[1]) and len(self.pos_hist) >= 8 and t - self.pos_hist[0][0] > 0.9 and mode not in ("peek",):
+        elif (move[0] or move[1]) and len(self.pos_hist) >= 8 and t - self.pos_hist[0][0] > 0.9 and mode not in ("peek", "climb", "perch", "drop"):
             h = self.pos_hist[0]
             if math.hypot(self.pos[0] - h[1], self.pos[1] - h[2]) < 1.5 and not any(fire):
                 a = random.random() * TAU
@@ -985,6 +1141,8 @@ class Bot:
         if boost and me["energy"] < 6:
             boost = False
         sp = 0.42 if sneak else 1.0
+        if self._roof_jump:
+            act["jump"] = True
         act["move"] = [round(move[0] * sp, 3), round(move[1] * sp, 3)]
         act["boost"] = bool(boost)
         act["aim"] = [round(aim_yaw, 4), round(aim_pitch, 4)]
@@ -1097,15 +1255,17 @@ class Bot:
             if self.bad_pickups.get(pid, 0) > t:
                 continue
             v = 0.0
-            if me["weapons"][1] is None:
-                if kind == "laser" and "laser" not in have:
-                    v = 3.0
-                elif kind == "lightning" and "lightning" not in have:
+            if kind == "laser" and "laser" not in have:
+                v = 12.0                     # the laser is by far the best weapon: take it even over lightning/mortar
+            elif me["weapons"][1] is None:
+                if kind == "lightning" and "lightning" not in have:
                     v = 2.6
             if v <= 0:
                 continue
             d = hyp(pp, self.pos)
-            if d > 260 or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
+            if d > (420 if kind == "laser" else 260) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
+                continue
+            if self.contested(pp, 0.55 if kind == "laser" else 0.7):
                 continue
             sc = v / (d + 40.0)
             if sc > bestv:
@@ -1114,7 +1274,8 @@ class Bot:
             return self.path_dir((want[0], want[1])), "loot", False
         if self.hpf > 0.7:
             for c in self.obs["cubes"]:
-                if hyp(c["pos"], self.pos) < 70 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8:
+                if (hyp(c["pos"], self.pos) < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8
+                        and not self.contested(c["pos"])):
                     return self.path_dir((c["pos"][0], c["pos"][1])), "cube", False
             best = None
             for c in self.obs["crates"]:
@@ -1146,21 +1307,28 @@ class Bot:
     # ------------------------------------------------------------------ pickups
     def pickup_action(self, wk):
         me = self.me
-        if me["weapons"][1] is not None:
-            return None
         have = set(wk)
+        full = me["weapons"][1] is not None
+        if full and "laser" in have:
+            return None
+        charging = any(w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"])
         best = None
         for pid, (kind, pp) in self.known_pickups.items():
             if self.bad_pickups.get(pid, 0) > self.t:
                 continue
             if kind in have or kind in ("mortar", "gun"):
                 continue
+            if full and kind != "laser":
+                continue
             if hyp(pp, self.pos) < 3.6 and abs(pp[2] - self.pos[2]) < 3.5:
                 pr = 2 if kind == "laser" else 1
                 if best is None or pr > best[0]:
                     best = (pr, pid)
         if best:
-            return {"take": best[1]}
+            r = {"take": best[1]}
+            if full:
+                r["drop"] = 1
+            return r
         return None
 
 
