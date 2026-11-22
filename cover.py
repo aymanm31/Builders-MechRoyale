@@ -105,7 +105,9 @@ class CoverPlanner:
                 break
             if not w.line_walkable(me, (x, y), 2.0):
                 cost += 25
-            P = self._peek_point(th_eye, x, y, threat, t_end + 0.005)
+            P = self._peek_point(th_eye, x, y, threat, t_end + 0.005, extra_eyes)
+            if P is None and extra_eyes:
+                P = self._peek_point(th_eye, x, y, threat, t_end + 0.008)
             if P is None:
                 total = cost + 20
             else:
@@ -117,7 +119,7 @@ class CoverPlanner:
             best = (cost, x, y, None, d)
         return {"C": (best[1], best[2]), "P": best[3], "dthr": best[4]}
 
-    def _peek_point(self, th_eye, cx, cy, threat, deadline=1e18):
+    def _peek_point(self, th_eye, cx, cy, threat, deadline=1e18, extra_eyes=()):
         """Nearest walkable spot to (cx, cy) from which the threat is visible."""
         w = self.w
         base = math.atan2(threat[1] - cy, threat[0] - cx)
@@ -132,6 +134,8 @@ class CoverPlanner:
                     continue
                 if not self.visible(th_eye, x, y):
                     continue
+                if extra_eyes and any(self.visible(ee, x, y) for ee in extra_eyes):
+                    continue                  # isolate the fight: only the main threat may see the peek point
                 if not w.line_walkable((cx, cy), (x, y), 1.5):
                     continue
                 return (x, y)

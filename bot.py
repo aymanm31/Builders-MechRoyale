@@ -18,8 +18,7 @@ from world import World
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-GHOST = os.environ.get("MECHBOT_GHOST", "1") == "1"   # stealth: never start a fight, only answer one
-AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "99" if GHOST else "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
@@ -58,7 +57,7 @@ def rot(x, y, a):
 
 
 class Bot:
-    name = "ghost-v1"
+    name = "duelist-v1"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -337,24 +336,58 @@ class Bot:
         p += max(0.0, (self.t - 150.0) / 60.0)
         return p
 
-    def provoked(self, target):
-        """Ghost rule: we only shoot (and peek) when someone is already on us."""
-        if self.t - self.last_dmg_t < 8.0:
-            return True
-        if target is None:
-            return False
-        if target["_d"] < 70:
-            return True
-        return bool(target.get("charging") and target.get("_aimed") and target["_d"] < 280)
+    def strength(self, hp, cubes, weapons):
+        s = hp * (1.0 + 0.04 * min(cubes, 10))
+        if "laser" in weapons:
+            s *= 1.5                      # the laser is by far the best weapon
+        elif "lightning" in weapons or "mortar" in weapons:
+            s *= 1.15
+        return s
+
+    def duel_ok(self, target):
+        """Fight a lone enemy only when we are the (roughly) stronger side; hysteresis so we don't flip-flop."""
+        me = self.me
+        mine = self.strength(self.hp, me.get("cubes", 0), [w["kind"] for w in me["weapons"] if w])
+        theirs = self.strength(target.get("hp", 1400), target.get("cubes", 0), target.get("weapons", []))
+        ratio = mine / max(theirs, 1.0)
+        return ratio >= (0.6 if self.duel_state else 0.85), ratio
 
     def is_aggro(self, target):
+        near = [e for e in self.enemies if e["_d"] < 150 and (e["_vis"] or self.t - self.enemy_seen.get(e["id"], -99) < 5.0)]
+        mx_hp = float(self.me.get("max_hp", 1400))
+        finisher = (target is not None and target.get("kind") == "mech" and target.get("hp", 1400) < 0.14 * mx_hp
+                    and target["_d"] < 130 and self.hpf > 0.25)
+        if target is not None and target.get("kind") == "mech" and not finisher:
+            if len(near) >= 2:
+                # outnumbered: never trade in the open; use cover and let the peek logic isolate one of them
+                if self.aggro_state:
+                    self.log("AGGRO off (outnumbered x%d)" % len(near), True)
+                self.aggro_state = False
+                self.duel_state = False
+                return False
+            if len(near) == 1 and self.hpf > (0.3 if self.duel_state else 0.5):
+                ok, ratio = self.duel_ok(target)
+                if ok:
+                    if not self.duel_state:
+                        self.log("DUEL on ratio %.2f" % ratio, True)
+                    self.duel_state = True
+                    self.aggro_state = True
+                    return True
+        if finisher:
+            self.aggro_state = True
+            return True
+        self.duel_state = False
+        self.aggro_state = False
+        return False
+
+    def is_aggro_old(self, target):
         p = self.power(target)
         want = p >= AGGRO_SCORE
         if self.aggro_state:
             want = p >= AGGRO_SCORE - 0.5       # hysteresis
         # duel: a lone tracked enemy that isn't clearly stronger gets fought properly even when weak.
         # (Hunters know where we are, so hiding from a single one just means being shot while "hidden".)
-        if (not want and DUEL and (not GHOST or self.provoked(target)) and target is not None and target.get("kind") == "mech"
+        if (not want and DUEL and target is not None and target.get("kind") == "mech"
                 and len(self.enemies) == 1 and self.hpf > (0.35 if self.duel_state else 0.55)
                 and target.get("hp", 1400) <= self.hp * 1.35 + 200
                 and target.get("cubes", 0) <= self.me.get("cubes", 0) + 3):
@@ -728,7 +761,7 @@ class Bot:
                 self.cov["peeks"] += 1
                 self.log("cover compromised -> fight back")
             elif (target is not None and target["_d"] < MAX_ENGAGE and t >= self.next_peek
-                  and self.hpf >= 0.35 and (not GHOST or self.provoked(target)) and self.peek_ready(target)):
+                  and self.hpf >= 0.35 and self.peek_ready(target)):
                 self.cs, self.cs_t, self.expo, self.peek_hp0, self.peek_t0 = "peek", t, 0.0, self.hp, t
                 self.cov["peeks"] += 1
                 self.peek_count += 1
@@ -967,7 +1000,7 @@ class Bot:
         target = None
         if vis_en:
             # focus fire: stick with the current victim (damage spread over several mechs just regenerates)
-            target = min(vis_en, key=lambda e: e.get("hp", 1400) * (0.6 + e["_d"] / 250.0)
+            target = min(vis_en, key=lambda e: e.get("hp", 1400) * (0.6 + e["_d"] / 250.0) * (1.0 + 0.35 * sum(1 for o_ in vis_en if o_ is not e and hyp(o_["pos"], e["pos"]) < 45))
                          * (0.55 if e["id"] == self.focus_id else 1.0))
             self.focus_id = target["id"]
         elif mem_en:
@@ -1087,9 +1120,6 @@ class Bot:
         if weapon_target is None and self._aux_target is None and pseudo is not None:
             weapon_target = None
         aim_yaw, aim_pitch, fire, reload = self.weapon_plan(weapon_target, mode)
-        if GHOST and mode not in ("zone",) and not self.provoked(target):
-            fire = [False for _ in fire]                      # every shot is a sound: stay quiet
-            self._aux_target = None
         if weapon_target is None:
             ct = self._aux_target
             if ct is not None:
@@ -1280,7 +1310,7 @@ class Bot:
             if v <= 0:
                 continue
             d = hyp(pp, self.pos)
-            if d > (110 if kind == "laser" else 60) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
+            if d > (300 if kind == "laser" else 260) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
                 continue
             if self.contested(pp, 0.55 if kind == "laser" else 0.7):
                 continue
@@ -1291,16 +1321,16 @@ class Bot:
             return self.path_dir((want[0], want[1])), "loot", False
         if self.hpf > 0.7:
             for c in self.obs["cubes"]:
-                if (hyp(c["pos"], self.pos) < 40 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8
+                if (hyp(c["pos"], self.pos) < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8
                         and not self.contested(c["pos"])):
                     return self.path_dir((c["pos"][0], c["pos"][1])), "cube", False
             best = None
             for c in self.obs["crates"]:
                 d = hyp(c["pos"], self.pos)
-                if not GHOST and d < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8:
+                if d < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8:
                     if best is None or d < best[0]:
                         best = (d, c, "crate")
-            if best is None and self.hpf > 0.9 and not GHOST:
+            if best is None and self.hpf > 0.9:
                 for n in self.npcs:
                     d = n["_d"]
                     if d < 55 and n["_vis"] and self.in_safe_zone(n["pos"], 10):
