@@ -18,7 +18,7 @@ from world import World
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "3"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
@@ -31,7 +31,8 @@ UPGRADE_RANK = [
     "lightning_chain", "gun_velocity", "gun_mag", "lightning_range", "laser_pierce",
     "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
-AIM_LAT = 0.08            # s between the observation and the action taking effect (lead compensation)
+ROOF_ENABLED = os.environ.get("MECHBOT_ROOF", "0") == "1"   # rooftops: off until proven (v1.3 dropped to 2.69)
+AIM_LAT = 0.06            # s between the observation and the action taking effect (lead compensation)
 LASER_RANK = ["laser_damage", "laser_charge", "armor", "laser_pierce"]
 HOSTILE_SOUNDS = ("gun", "laser", "laser_charge", "lightning", "mortar", "explosion")
 CLOSE_SOUNDS = ("step", "boost", "jet", "reload")
@@ -56,7 +57,7 @@ def rot(x, y, a):
 
 
 class Bot:
-    name = "peeker-v1.3"
+    name = "peeker-v1.4"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -812,6 +813,8 @@ class Bot:
         r = self.roof
         thr = target["pos"] if target is not None else None
         if r is None:
+            if not ROOF_ENABLED:
+                return None
             dur = float(self.cfg["match"].get("duration_s", 480))
             if (t > 0.30 * dur or me.get("cubes", 0) >= 8):
                 return None                  # rooftops are an early-game tool only
@@ -1263,7 +1266,7 @@ class Bot:
             if v <= 0:
                 continue
             d = hyp(pp, self.pos)
-            if d > (420 if kind == "laser" else 260) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
+            if d > (300 if kind == "laser" else 260) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
                 continue
             if self.contested(pp, 0.55 if kind == "laser" else 0.7):
                 continue

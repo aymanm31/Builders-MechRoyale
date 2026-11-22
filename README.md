@@ -1,4 +1,4 @@
-# mechfight bot v1.3 ("peeker" + laser priority, rooftops, contested cubes, aim fixes)
+# mechfight bot v1 ("peeker")
 Python bot for the Mech Royale track (protocol mechfight/1). Standard library only.
 
 - `bot.py`: decision logic: cover/peek state machine, thruster dodging, power-scaled aggression, loot, zone, drops
