@@ -31,6 +31,7 @@ UPGRADE_RANK = [
     "lightning_chain", "gun_velocity", "gun_mag", "lightning_range", "laser_pierce",
     "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
+BARON = os.environ.get("MECHBOT_BARON", "1") == "1"   # economy play: sweep the map for crates/NPCs/cubes early
 ROOF_ENABLED = os.environ.get("MECHBOT_ROOF", "0") == "1"   # rooftops: off until proven (v1.3 dropped to 2.69)
 AIM_LAT = 0.06            # s between the observation and the action taking effect (lead compensation)
 LASER_RANK = ["laser_damage", "laser_charge", "armor", "laser_pierce"]
@@ -57,7 +58,7 @@ def rot(x, y, a):
 
 
 class Bot:
-    name = "peeker-v1.4"
+    name = "baron-v2"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -84,6 +85,11 @@ class Bot:
         self.known_pickups = {}
         self.bad_pickups = {}
         self.enemy_seen = {}
+        self.crate_mem = {}
+        self.npc_mem = {}
+        self.visited = set()
+        self.ex_goal = None
+        self.ex_reset = 0
         # damage / alerts
         self.last_dmg_t = -99.0
         self.last_dmg_bearing = None
@@ -801,6 +807,90 @@ class Bot:
         boost = t < self.kick_until or (aggressive and rad > 0 and d > 150 and self.me["energy"] > 85)
         return move, boost
 
+    # ------------------------------------------------------------------ economy ("baron")
+    EXC = 50.0
+
+    def update_farm_memory(self, obs):
+        t = self.t
+        px, py = self.pos[0], self.pos[1]
+        seen = set()
+        for c in obs["crates"]:
+            seen.add(c["id"])
+            self.crate_mem[c["id"]] = (c["pos"], t)
+        for cid in list(self.crate_mem):
+            if cid in seen:
+                continue
+            p, _ = self.crate_mem[cid]
+            if math.hypot(p[0] - px, p[1] - py) < 40:       # we should see it from here; it must be gone
+                del self.crate_mem[cid]
+        for n in self.npcs:
+            self.npc_mem[n["id"]] = (n["pos"], t)
+        for e in obs["events"]:
+            if e["type"] == "kill":
+                self.npc_mem.pop(e.get("target"), None)
+        for nid in list(self.npc_mem):
+            if t - self.npc_mem[nid][1] > 45:
+                del self.npc_mem[nid]
+        # coverage grid: mark cells we have been close to
+        C = self.EXC
+        ci, cj = int((px - self.world.minx) / C), int((py - self.world.miny) / C)
+        for di in range(-2, 3):
+            for dj in range(-2, 3):
+                cx = self.world.minx + (ci + di + 0.5) * C
+                cy = self.world.miny + (cj + dj + 0.5) * C
+                if math.hypot(cx - px, cy - py) < 65:
+                    self.visited.add((ci + di, cj + dj))
+
+    def enemy_near(self, p, r):
+        for e in self.enemies:
+            if (e["_vis"] or self.t - self.enemy_seen.get(e["id"], -99) < 8.0) and hyp(e["pos"], p) < r:
+                return True
+        return False
+
+    def farm_goal(self):
+        """Where to walk to find/clear loot: remembered crates, then NPC homes, then unexplored ground."""
+        t = self.t
+        best = None
+        for cid, (p, _) in self.crate_mem.items():
+            d = hyp(p, self.pos)
+            if d < 280 and self.in_safe_zone(p, 12) and not self.enemy_near(p, 100) and abs(p[2] - self.pos[2]) < 30:
+                if best is None or d < best[0]:
+                    best = (d, (p[0], p[1]))
+        for nid, (p, tt) in self.npc_mem.items():
+            d = hyp(p, self.pos)
+            if d < 200 and self.in_safe_zone(p, 12) and not self.enemy_near(p, 100):
+                if best is None or d + 30 < best[0]:
+                    best = (d + 30, (p[0], p[1]))
+        if best is not None:
+            self.ex_goal = None
+            return best[1]
+        g = self.ex_goal
+        if g is not None:
+            if hyp(g, self.pos) < 25 or not self.in_safe_zone(g, 20) or self.enemy_near(g, 90):
+                g = self.ex_goal = None
+        if g is None:
+            C = self.EXC
+            zc = self.circle_at(t + 6)
+            cand = None
+            for ci in range(int((self.world.maxx - self.world.minx) / C)):
+                for cj in range(int((self.world.maxy - self.world.miny) / C)):
+                    if (ci, cj) in self.visited:
+                        continue
+                    cx = self.world.minx + (ci + 0.5) * C
+                    cy = self.world.miny + (cj + 0.5) * C
+                    if self.world.walk_blocked(cx, cy) or not self.in_safe_zone((cx, cy), 25) or self.enemy_near((cx, cy), 90):
+                        continue
+                    sc = hyp((cx, cy), self.pos) + 0.25 * hyp((cx, cy), (zc[0], zc[1])) + self.rng.random() * 15
+                    if cand is None or sc < cand[0]:
+                        cand = (sc, (cx, cy))
+            if cand is None:
+                if t - self.ex_reset > 30:
+                    self.visited = set()
+                    self.ex_reset = t
+                return None
+            g = self.ex_goal = cand[1]
+        return g
+
     # ------------------------------------------------------------------ rooftops
     def roof_end(self, why, cd=25.0):
         self.log("ROOF end: %s" % why, True)
@@ -935,6 +1025,7 @@ class Bot:
     def act(self, obs):
         self.t0 = time.perf_counter()
         self.ingest(obs)
+        self.update_farm_memory(obs)
         me = self.me
         t = self.t
         act = {"tick": obs["tick"]}
@@ -1292,6 +1383,12 @@ class Bot:
                     if d < 55 and n["_vis"] and self.in_safe_zone(n["pos"], 10):
                         if best is None or d < best[0]:
                             best = (d, n, "npc")
+            if best is None and BARON and self.hpf > 0.8:
+                dur = float(self.cfg["match"].get("duration_s", 480))
+                if t < 0.55 * dur and me.get("cubes", 0) < 24:
+                    fg = self.farm_goal()
+                    if fg is not None:
+                        return self.path_dir(fg), "explore", False
             if best is not None:
                 d, c, kind = best
                 self._aux_target = (c, kind)
