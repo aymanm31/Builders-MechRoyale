@@ -18,7 +18,8 @@ from world import World
 TAU = math.tau
 
 # ----------------------------------------------------------------------------- tunables
-AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
+GHOST = os.environ.get("MECHBOT_GHOST", "1") == "1"   # stealth: never start a fight, only answer one
+AGGRO_SCORE = float(os.environ.get("MECHBOT_AGGRO", "99" if GHOST else "0"))  # 0 = always push; was 4.0 in v1.1        # power score at which the bot stops peeking and just beams (see power())
 DUEL = os.environ.get("MECHBOT_DUEL", "1") == "1"   #              # fight a lone, not-clearly-stronger enemy even when weak
 AGGRO_HP_MIN = 0.40      # below this hp fraction even a strong bot goes back to cover
 PEEK_BUDGET = {"gun": 0.75, "laser": 1.1, "lightning": 1.0}   # max seconds exposed per peek
@@ -31,7 +32,6 @@ UPGRADE_RANK = [
     "lightning_chain", "gun_velocity", "gun_mag", "lightning_range", "laser_pierce",
     "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
-BARON = os.environ.get("MECHBOT_BARON", "1") == "1"   # economy play: sweep the map for crates/NPCs/cubes early
 ROOF_ENABLED = os.environ.get("MECHBOT_ROOF", "0") == "1"   # rooftops: off until proven (v1.3 dropped to 2.69)
 AIM_LAT = 0.06            # s between the observation and the action taking effect (lead compensation)
 LASER_RANK = ["laser_damage", "laser_charge", "armor", "laser_pierce"]
@@ -58,7 +58,7 @@ def rot(x, y, a):
 
 
 class Bot:
-    name = "baron-v2"
+    name = "ghost-v1"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -85,11 +85,6 @@ class Bot:
         self.known_pickups = {}
         self.bad_pickups = {}
         self.enemy_seen = {}
-        self.crate_mem = {}
-        self.npc_mem = {}
-        self.visited = set()
-        self.ex_goal = None
-        self.ex_reset = 0
         # damage / alerts
         self.last_dmg_t = -99.0
         self.last_dmg_bearing = None
@@ -342,6 +337,16 @@ class Bot:
         p += max(0.0, (self.t - 150.0) / 60.0)
         return p
 
+    def provoked(self, target):
+        """Ghost rule: we only shoot (and peek) when someone is already on us."""
+        if self.t - self.last_dmg_t < 8.0:
+            return True
+        if target is None:
+            return False
+        if target["_d"] < 70:
+            return True
+        return bool(target.get("charging") and target.get("_aimed") and target["_d"] < 280)
+
     def is_aggro(self, target):
         p = self.power(target)
         want = p >= AGGRO_SCORE
@@ -349,7 +354,7 @@ class Bot:
             want = p >= AGGRO_SCORE - 0.5       # hysteresis
         # duel: a lone tracked enemy that isn't clearly stronger gets fought properly even when weak.
         # (Hunters know where we are, so hiding from a single one just means being shot while "hidden".)
-        if (not want and DUEL and target is not None and target.get("kind") == "mech"
+        if (not want and DUEL and (not GHOST or self.provoked(target)) and target is not None and target.get("kind") == "mech"
                 and len(self.enemies) == 1 and self.hpf > (0.35 if self.duel_state else 0.55)
                 and target.get("hp", 1400) <= self.hp * 1.35 + 200
                 and target.get("cubes", 0) <= self.me.get("cubes", 0) + 3):
@@ -723,7 +728,7 @@ class Bot:
                 self.cov["peeks"] += 1
                 self.log("cover compromised -> fight back")
             elif (target is not None and target["_d"] < MAX_ENGAGE and t >= self.next_peek
-                  and self.hpf >= 0.35 and self.peek_ready(target)):
+                  and self.hpf >= 0.35 and (not GHOST or self.provoked(target)) and self.peek_ready(target)):
                 self.cs, self.cs_t, self.expo, self.peek_hp0, self.peek_t0 = "peek", t, 0.0, self.hp, t
                 self.cov["peeks"] += 1
                 self.peek_count += 1
@@ -806,90 +811,6 @@ class Bot:
         move = norm(ux * rad * (1.0 if aggressive else 0.8) + tx, uy * rad * (1.0 if aggressive else 0.8) + ty)
         boost = t < self.kick_until or (aggressive and rad > 0 and d > 150 and self.me["energy"] > 85)
         return move, boost
-
-    # ------------------------------------------------------------------ economy ("baron")
-    EXC = 50.0
-
-    def update_farm_memory(self, obs):
-        t = self.t
-        px, py = self.pos[0], self.pos[1]
-        seen = set()
-        for c in obs["crates"]:
-            seen.add(c["id"])
-            self.crate_mem[c["id"]] = (c["pos"], t)
-        for cid in list(self.crate_mem):
-            if cid in seen:
-                continue
-            p, _ = self.crate_mem[cid]
-            if math.hypot(p[0] - px, p[1] - py) < 40:       # we should see it from here; it must be gone
-                del self.crate_mem[cid]
-        for n in self.npcs:
-            self.npc_mem[n["id"]] = (n["pos"], t)
-        for e in obs["events"]:
-            if e["type"] == "kill":
-                self.npc_mem.pop(e.get("target"), None)
-        for nid in list(self.npc_mem):
-            if t - self.npc_mem[nid][1] > 45:
-                del self.npc_mem[nid]
-        # coverage grid: mark cells we have been close to
-        C = self.EXC
-        ci, cj = int((px - self.world.minx) / C), int((py - self.world.miny) / C)
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                cx = self.world.minx + (ci + di + 0.5) * C
-                cy = self.world.miny + (cj + dj + 0.5) * C
-                if math.hypot(cx - px, cy - py) < 65:
-                    self.visited.add((ci + di, cj + dj))
-
-    def enemy_near(self, p, r):
-        for e in self.enemies:
-            if (e["_vis"] or self.t - self.enemy_seen.get(e["id"], -99) < 8.0) and hyp(e["pos"], p) < r:
-                return True
-        return False
-
-    def farm_goal(self):
-        """Where to walk to find/clear loot: remembered crates, then NPC homes, then unexplored ground."""
-        t = self.t
-        best = None
-        for cid, (p, _) in self.crate_mem.items():
-            d = hyp(p, self.pos)
-            if d < 280 and self.in_safe_zone(p, 12) and not self.enemy_near(p, 100) and abs(p[2] - self.pos[2]) < 30:
-                if best is None or d < best[0]:
-                    best = (d, (p[0], p[1]))
-        for nid, (p, tt) in self.npc_mem.items():
-            d = hyp(p, self.pos)
-            if d < 200 and self.in_safe_zone(p, 12) and not self.enemy_near(p, 100):
-                if best is None or d + 30 < best[0]:
-                    best = (d + 30, (p[0], p[1]))
-        if best is not None:
-            self.ex_goal = None
-            return best[1]
-        g = self.ex_goal
-        if g is not None:
-            if hyp(g, self.pos) < 25 or not self.in_safe_zone(g, 20) or self.enemy_near(g, 90):
-                g = self.ex_goal = None
-        if g is None:
-            C = self.EXC
-            zc = self.circle_at(t + 6)
-            cand = None
-            for ci in range(int((self.world.maxx - self.world.minx) / C)):
-                for cj in range(int((self.world.maxy - self.world.miny) / C)):
-                    if (ci, cj) in self.visited:
-                        continue
-                    cx = self.world.minx + (ci + 0.5) * C
-                    cy = self.world.miny + (cj + 0.5) * C
-                    if self.world.walk_blocked(cx, cy) or not self.in_safe_zone((cx, cy), 25) or self.enemy_near((cx, cy), 90):
-                        continue
-                    sc = hyp((cx, cy), self.pos) + 0.25 * hyp((cx, cy), (zc[0], zc[1])) + self.rng.random() * 15
-                    if cand is None or sc < cand[0]:
-                        cand = (sc, (cx, cy))
-            if cand is None:
-                if t - self.ex_reset > 30:
-                    self.visited = set()
-                    self.ex_reset = t
-                return None
-            g = self.ex_goal = cand[1]
-        return g
 
     # ------------------------------------------------------------------ rooftops
     def roof_end(self, why, cd=25.0):
@@ -1025,7 +946,6 @@ class Bot:
     def act(self, obs):
         self.t0 = time.perf_counter()
         self.ingest(obs)
-        self.update_farm_memory(obs)
         me = self.me
         t = self.t
         act = {"tick": obs["tick"]}
@@ -1167,6 +1087,9 @@ class Bot:
         if weapon_target is None and self._aux_target is None and pseudo is not None:
             weapon_target = None
         aim_yaw, aim_pitch, fire, reload = self.weapon_plan(weapon_target, mode)
+        if GHOST and mode not in ("zone",) and not self.provoked(target):
+            fire = [False for _ in fire]                      # every shot is a sound: stay quiet
+            self._aux_target = None
         if weapon_target is None:
             ct = self._aux_target
             if ct is not None:
@@ -1357,7 +1280,7 @@ class Bot:
             if v <= 0:
                 continue
             d = hyp(pp, self.pos)
-            if d > (300 if kind == "laser" else 260) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
+            if d > (110 if kind == "laser" else 60) or not self.in_safe_zone(pp, 15) or abs(pp[2] - self.pos[2]) > 14:
                 continue
             if self.contested(pp, 0.55 if kind == "laser" else 0.7):
                 continue
@@ -1368,27 +1291,21 @@ class Bot:
             return self.path_dir((want[0], want[1])), "loot", False
         if self.hpf > 0.7:
             for c in self.obs["cubes"]:
-                if (hyp(c["pos"], self.pos) < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8
+                if (hyp(c["pos"], self.pos) < 40 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8
                         and not self.contested(c["pos"])):
                     return self.path_dir((c["pos"][0], c["pos"][1])), "cube", False
             best = None
             for c in self.obs["crates"]:
                 d = hyp(c["pos"], self.pos)
-                if d < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8:
+                if not GHOST and d < 90 and self.in_safe_zone(c["pos"], 10) and abs(c["pos"][2] - self.pos[2]) < 8:
                     if best is None or d < best[0]:
                         best = (d, c, "crate")
-            if best is None and self.hpf > 0.9:
+            if best is None and self.hpf > 0.9 and not GHOST:
                 for n in self.npcs:
                     d = n["_d"]
                     if d < 55 and n["_vis"] and self.in_safe_zone(n["pos"], 10):
                         if best is None or d < best[0]:
                             best = (d, n, "npc")
-            if best is None and BARON and self.hpf > 0.8:
-                dur = float(self.cfg["match"].get("duration_s", 480))
-                if t < 0.55 * dur and me.get("cubes", 0) < 24:
-                    fg = self.farm_goal()
-                    if fg is not None:
-                        return self.path_dir(fg), "explore", False
             if best is not None:
                 d, c, kind = best
                 self._aux_target = (c, kind)
